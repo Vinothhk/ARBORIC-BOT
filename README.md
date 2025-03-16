@@ -1,6 +1,6 @@
 # Arboric bot - 🌳 🤖
 
-A bot navigates around employing BehaviorTree &amp; ComputerVision
+A robot navigates around employing BehaviorTree &amp; ComputerVision
 
 ## Clone 
 Clone the repository
