@@ -1,0 +1,46 @@
+<root BTCPP_format="4">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="root_sequence">
+      <!-- Wait until a request is received from GUI -->
+      <WaitForRequest name="wait_for_request" status="{status}"/>
+      
+      <Parallel name="main_parallel">
+        <Sequence name="robot_navigation">
+          <Fallback name="find_marker_fallback">
+            <MarkerFound name="marker_found" marker_id="{target_marker}"/>
+            <!-- <Sequence name="search_marker_sequence">
+              <SpinSearch name="spin_search"/>
+              <MoveSlightly name="recovery_movement"/>
+            </Sequence> -->
+            <WhileTrue name="search_loop">
+              <Fallback name="search_marker_sequence">
+                <MarkerFound name="marker_found" marker_id="{target_marker}"/>
+                <SpinSearch name="spin_search" marker_id="{target_marker}"/>
+                <!-- <MoveSlightly name="recovery_movement"/> -->
+                <MoveSlightly name="recovery_movement" marker_id="{target_marker}"/>
+              </Fallback>
+            </WhileTrue>
+          </Fallback>
+
+          <WhileTrue name="move">
+          <Sequence name="loop_sequence">
+            <Fallback name="move_loop">
+              <Sequence name="move_sequence">
+                <StoreMarkerRelation name="store_marker_relation" marker_id="{target_marker}"/>
+                <ApproachMarker name="approach_marker" marker_id="{target_marker}"/>
+              </Sequence>
+
+              <Fallback name="search_move">
+                <SpinSearch name="spin_search" marker_id="{target_marker}"/>
+                <MoveSlightly name="recovery_movement" marker_id="{target_marker}"/>
+              </Fallback>
+            </Fallback>
+
+            <GoalReached name="goal_reached" marker_id="{target_marker}"/>
+          </Sequence>
+          </WhileTrue>
+        </Sequence>
+      </Parallel>
+    </Sequence>
+  </BehaviorTree>
+</root>

@@ -1,0 +1,21 @@
+<root BTCPP_format="4">
+  <BehaviorTree ID="MainTree">
+    <Fallback name="root_fallback">
+      <Sequence name="robot_task_sequence">
+        <Fallback name="detect_marker_fallback">
+          <MarkerVisible name="is_marker_visible"/>
+          <SearchMarker name="search_for_marker" marker="{targetMarker}"/>
+        </Fallback>
+        <Fallback name="approach_marker_fallback">
+          <CloseToMarker name="is_close_to_marker"/>
+          <MoveToMarker name="move_to_marker" marker="{targetMarker}"/>
+        </Fallback>
+        <Fallback name="perform_task_fallback">
+          <TaskReady name="task_ready"/>
+          <PerformTask name="perform_task"/>
+        </Fallback>
+      </Sequence>
+      <AskForHelp name="ask_for_help"/>
+    </Fallback>
+  </BehaviorTree>
+</root>

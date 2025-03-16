@@ -1,0 +1,7 @@
+Abstract
+
+Autonomous navigation in dynamic environments is a crucial challenge in robotics, requiring efficient localization, obstacle avoidance, and adaptive decision-making. This research presents a behavior tree-based navigation framework that enables a mobile robot to traverse between predefined markers while dynamically updating its localization. The proposed system leverages marker-based visual localization, where the robot detects and tracks markers using an onboard camera. If a marker is not immediately found, a structured search behavior—consisting of rotational scanning and incremental movements—is executed until successful detection.
+
+To ensure robust navigation, the robot stores and correlates marker positions, refining its trajectory in real time. Additionally, a parallel obstacle avoidance module processes RGB camera data to detect and respond to nearby obstacles, ensuring safe movement. The integration of behavior trees enhances modularity, scalability, and adaptability, making the system suitable for warehouse automation, search-and-rescue missions, and autonomous logistics.
+
+Experimental evaluations demonstrate the efficiency and reliability of this approach in navigating complex environments. The results highlight the advantages of combining marker-based localization with hierarchical behavior trees, providing a structured yet flexible decision-making paradigm for autonomous robots.

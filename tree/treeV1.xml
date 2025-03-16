@@ -1,0 +1,38 @@
+<root BTCPP_format="4">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="root_sequence">
+      <!-- Wait until a request is received from GUI -->
+      <WaitForRequest name="wait_for_request" status="{status}"/>
+      
+      <Parallel name="main_parallel">
+        <Sequence name="robot_navigation">
+          <Fallback name="find_marker_fallback">
+            <MarkerFound name="marker_found" marker_id="{target_marker}"/>
+            <!-- <Sequence name="search_marker_sequence">
+              <SpinSearch name="spin_search"/>
+              <MoveSlightly name="recovery_movement"/>
+            </Sequence> -->
+            <WhileTrue name="search_loop">
+              <Fallback name="search_marker_sequence">
+                <MarkerFound name="marker_found" marker_id="{target_marker}"/>
+                <SpinSearch name="spin_search" marker_id="{target_marker}"/>
+                <!-- <MoveSlightly name="recovery_movement"/> -->
+                <MoveSlightly name="recovery_movement" marker_id="{target_marker}"/>
+              </Fallback>
+            </WhileTrue>
+          </Fallback>
+
+          <Sequence name="navigate_to_marker">
+            <StoreMarkerRelation name="store_marker_relation" marker_id="{target_marker}"/>
+            <ApproachMarker name="approach_marker" marker_id="{target_marker}"/>
+          </Sequence>
+        </Sequence>
+        
+        <Parallel name="obstacle_avoidance_parallel">
+          <AvoidObstacles name="avoid_obstacles"/>
+          <FollowPath name="follow_path"/>
+        </Parallel>
+      </Parallel>
+    </Sequence>
+  </BehaviorTree>
+</root>
