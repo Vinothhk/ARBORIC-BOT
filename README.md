@@ -2,7 +2,7 @@
 A bot navigates around employing BehaviorTree &amp; ComputerVision
 
 ```
-mkdir arboricbot
+mkdir -p arboricbot && cd arboricbot
 
 git clone https://github.com/Vinothhk/ARBORIC-BOT.git
 ```
@@ -13,6 +13,6 @@ mkdir build
 
 cmake ..
 
-#Make
+# Make them
 make
 ```
