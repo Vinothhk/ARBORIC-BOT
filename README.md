@@ -48,3 +48,21 @@ Make them
 ```
 make
 ```
+
+## camera calibration
+
+Images of Checkerboard size of (6,9) needed.
+
+To Capture and Save images:
+```
+./SaveImages
+```
+
+To save the Camera Matrix and Disortion Coefficients will be 
+saved in a .yaml file:
+```
+./CameraCalib
+```
+Note: These are automatically loaded when you run the main script.
+
+## Run the main script
