@@ -27,6 +27,11 @@
 #include <unordered_map>
 #include <vector>
 #include <queue>
+#include <onnxruntime_cxx_api.h>
+
+#define FRAME_CENTER_X 320  // Adjust based on camera resolution
+#define FRAME_CENTER_Y 240
+#define MARKER_SIZE_THRESHOLD 10000  // Adjust based on marker size wh
 
 using namespace std::chrono_literals;
 using namespace cv;
@@ -39,6 +44,9 @@ struct MarkerNode {
 
 struct SharedData {
     std::mutex mtx;
+    std::vector<cv::Point2f> corners;
+    string ObstacleDirection = "";
+    string initRot = "";
     bool isGUIrequest = false;
     bool markerVisible = false;
     int detectedMarkerID = -1;
@@ -46,7 +54,50 @@ struct SharedData {
     bool obstacleDetected = false;
     int serial_port;
     int targetMarkerID = -1;
+    bool GoalReached = false;
     map<pair<int, int>, string> MarkerMap;
+};
+
+class ParallelNode : public BT::ControlNode {
+public:
+    ParallelNode(const std::string& name, const BT::NodeConfiguration& config)
+        : BT::ControlNode(name, config), success_threshold_(1), failure_threshold_(1) {}
+
+    void set_success_threshold(int threshold) { success_threshold_ = threshold; }
+    void set_failure_threshold(int threshold) { failure_threshold_ = threshold; }
+
+    BT::NodeStatus tick() override {
+        std::atomic<int> success_count{0};
+        std::atomic<int> failure_count{0};
+        std::vector<std::thread> threads;
+        std::mutex child_mutex;
+
+        for (BT::TreeNode* child : children_nodes_) {
+            threads.emplace_back([&, child]() {
+                BT::NodeStatus child_status;
+                {
+                    std::lock_guard<std::mutex> lock(child_mutex); // Ensure safe execution
+                    child_status = child->executeTick();
+                }
+
+                if (child_status == BT::NodeStatus::SUCCESS) {
+                    success_count.fetch_add(1, std::memory_order_relaxed);
+                } else if (child_status == BT::NodeStatus::FAILURE) {
+                    failure_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+
+        for (auto& t : threads) t.join(); // Wait for all child nodes
+
+        if (success_count >= success_threshold_) return BT::NodeStatus::SUCCESS;
+        if (failure_count >= failure_threshold_) return BT::NodeStatus::FAILURE;
+        return BT::NodeStatus::RUNNING;
+    }
+
+private:
+    int success_threshold_;
+    int failure_threshold_;
 };
 
 
@@ -73,6 +124,7 @@ public:
         return BT::NodeStatus::FAILURE;
     }
 };
+
 
 class WaitForRequest : public BT::SyncActionNode {
     public:
@@ -139,7 +191,11 @@ class SpinSearch : public BT::SyncActionNode {
         
         BT::NodeStatus tick() override {
             std::cout << "Spinning to search for marker...\n";
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+
+            std::string command = "2 2\n";
+            write(sharedData->serial_port, command.c_str(), command.length()); 
+
+            // std::this_thread::sleep_for(std::chrono::seconds(2));
             return BT::NodeStatus::FAILURE;
         }
     private:
@@ -158,14 +214,18 @@ class MoveSlightly : public BT::SyncActionNode {
         
         BT::NodeStatus tick() override {
             std::cout << "Moving slightly to reposition for marker detection...\n";
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            std::string command = "1 1\n";
+            write(sharedData->serial_port, command.c_str(), command.length()); 
+
+            // std::this_thread::sleep_for(std::chrono::seconds(1));
             return BT::NodeStatus::FAILURE;
         }
     private:
         std::shared_ptr<SharedData> sharedData;
     };
         
-class StoreMarkerRelation : public BT::SyncActionNode {
+class StoreMarkerRelation : public BT::SyncActionNode{
 public:
     explicit StoreMarkerRelation(const std::string& name,const BT::NodeConfiguration& config, std::shared_ptr<SharedData> sharedData) 
         : BT::SyncActionNode(name, config), sharedData(sharedData) {}
@@ -177,6 +237,21 @@ public:
 
     BT::NodeStatus tick() override {
         std::cout << "Storing marker relation...\n";
+        string direction;
+        if (sharedData->markerVisible){
+            direction = findRelation(sharedData->detectedMarkerID, sharedData->targetMarkerID, sharedData->MarkerMap);
+        }
+        sharedData->initRot = direction;
+        if (direction == "NONE"){
+            std::cout << "The Marker has to move straight. No Turning Needed" <<std::endl;
+        }
+        else if (direction == "Right" || direction == "Left" ){
+            std::cout << "The Robot has to move: " << direction << std::endl;
+        }
+        else {
+            std::cout << "Marker not visible!" << std::endl;
+            return BT::NodeStatus::FAILURE;
+        }
         return BT::NodeStatus::SUCCESS;
     }
 
@@ -188,8 +263,11 @@ public:
     }
 
     // Function to find the relation between two markers
-    void findRelation(int start, int end, map<pair<int, int>, string>& myMap) {
+    string findRelation(int start, int end, map<pair<int, int>, string>& myMap) {
         // Step 1: Convert map into bidirectional adjacency list with opposite directions
+        if (start == end ){
+            return "NONE";
+        }
         unordered_map<int, vector<pair<int, string>>> adj;
         for (const auto& it : myMap) {
             int from = it.first.first;
@@ -214,7 +292,7 @@ public:
 
             if (current.marker == end) {
                 cout << "Relation from " << start << " to " << end << ": " << current.relation << endl;
-                return;
+                return current.relation;
             }
 
             for (const auto& neighbor : adj[current.marker]) {
@@ -245,6 +323,7 @@ private:
 };
 
 class ApproachMarker : public BT::SyncActionNode {
+// class ApproachMarker : public BT::SyncActionNode {
 public:
     ApproachMarker(const std::string& name, const BT::NodeConfiguration& config, std::shared_ptr<SharedData> sharedData) 
         : BT::SyncActionNode(name, config),sharedData(sharedData) {}
@@ -260,45 +339,147 @@ public:
             return BT::NodeStatus::FAILURE;
         }
         auto serial_port = sharedData->serial_port;
-        std::cout << "Approaching marker " << marker_id << "...\n";
 
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::string command = std::to_string(marker_id) + "\n";
-        for (int i = 0; i < 10; i++) {
-            cout<<"Sending command.. "<<endl;
-            write(serial_port, command.c_str(), command.size());
-            this_thread::sleep_for(1000ms);
+        string dir = sharedData->initRot;
+        std::cout << "Rotating to see the marker!" << std::endl;
+
+        if (dir ==  "NONE"){
+            cout << "Moving Straight.." << endl;
+        }
+        else if (dir ==  "Right"){
+            cout << "Moving RIGHT.." << endl;
+        }
+        else if (dir ==  "Left"){
+            cout << "Moving LEFT.." << endl;
         }
 
-        return BT::NodeStatus::SUCCESS;
+        while (!sharedData->obstacleDetected && sharedData->markerVisible){
+            std::cout << "Approaching marker " << sharedData->targetMarkerID << "...\n";
+            MoveToMarker();
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        if(sharedData->ObstacleDirection == "RIGHT"){
+            std::cout << "Move left .. "<<std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        else if(sharedData->ObstacleDirection == "CENTER") {
+            std::cout << "Move right .. "<<std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        else if(sharedData->ObstacleDirection == "LEFT") {
+            std::cout << "Move right .. "<<std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+        
+        // std::string command = std::to_string(marker_id) + "\n";
+        // for (int i = 0; i < 10; i++) {
+        //     cout<<"Sending command.. "<<endl;
+        //     write(serial_port, command.c_str(), command.size());
+        //     this_thread::sleep_for(1000ms);
+        // }
+        if (sharedData->markerVisible){
+            return BT::NodeStatus::SUCCESS;
+        }
+        else {
+            return BT::NodeStatus::FAILURE;
+        }
     }
+
+    void MoveToMarker(){
+        std::cout << "Corners: [ ";
+        corners = sharedData->corners;
+            std::cout << "[ ";
+            for (const auto& pt : corners) {
+                std::cout << "(" << pt.x << ", " << pt.y << ") ";
+            }
+            std::cout << "] ";
+        std::cout << "]" << std::endl;
+        Point2f marker_center = (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25;
+                int marker_x = static_cast<int>(marker_center.x);
+                int marker_y = static_cast<int>(marker_center.y);
+
+                // Compute the marker size (approximate area)
+                float marker_size = norm(corners[0] - corners[2]) * norm(corners[1] - corners[3]);
+
+                // Movement Logic
+                if (marker_size > MARKER_SIZE_THRESHOLD) {
+                    std::cout << "Stop" << std::endl;
+                    // sendCommand("Stop");
+                } else if (abs(marker_x - FRAME_CENTER_X) < 50) {  // Centered
+                    std::cout << "FORWARD" << std::endl;
+                } else if (marker_x < FRAME_CENTER_X) {  // Marker is left
+                    std::cout << "Left" << std::endl;
+                } else {  // Marker is right
+                    std::cout << "Right" << std::endl;
+                }
+            }
 private:
     std::shared_ptr<SharedData> sharedData;
+    std::vector<cv::Point2f> corners;
 };
-        
+    
 class AvoidObstacles : public BT::SyncActionNode {
+// class AvoidObstacles : public BT::SyncActionNode {
 public:
     AvoidObstacles(const std::string& name) : BT::SyncActionNode(name, {}) {}
     BT::NodeStatus tick() override {
-        std::cout << "Avoiding obstacles...\n";
+        std::cout << "Avoiding obstacles..." <<std::endl;
+        int i=1;
+        // for (i; i<10; i++){
+        //     std::cout << "AO: "<<i<< std::endl;
+        // }
+        while(i>0){
+            std::cout << "AO: "<<i<< std::endl;
+            i++;
+        }
         return BT::NodeStatus::SUCCESS;
     }
 };
 
 class FollowPath : public BT::SyncActionNode {
+// class FollowPath : public BT::SyncActionNode {
 public:
     FollowPath(const std::string& name) : BT::SyncActionNode(name, {}) {}
     BT::NodeStatus tick() override {
-        std::cout << "Following path...\n";
+        std::cout << "Following path..." <<std::endl;
+        int i=1;
+        // for (i; i<10; i++){
+        //     std::cout << "FP: "<<i<< std::endl;
+        // }
+        while(i>0){
+            std::cout << "FP: "<<i<< std::endl;
+            i++;
+        }
         return BT::NodeStatus::SUCCESS;
     }
+};
+
+class GoalReached : public BT::SyncActionNode {
+public:
+    GoalReached(const std::string& name,const BT::NodeConfiguration& config, std::shared_ptr<SharedData> sharedData) 
+        : BT::SyncActionNode(name, config),sharedData(sharedData) {}
+
+    static BT::PortsList providedPorts() {
+        return { BT::InputPort<int>("marker_id") };
+    }
+    BT::NodeStatus tick() override {
+        if (sharedData->GoalReached)
+            std::cout << "Goal Reached :)) " <<std::endl;
+        else {
+            std::cout << "Goal Not Reached :( " <<std::endl;
+        }
+        return BT::NodeStatus::FAILURE;
+    }
+private:
+    std::shared_ptr<SharedData> sharedData;
 };
 
 class DualFeedGUI : public QWidget {
     Q_OBJECT
 
 public:
-    explicit DualFeedGUI(std::shared_ptr<SharedData> &sharedData, const cv::Mat& cameraMatrix, const cv::Mat& distCoeffs, QWidget *parent = nullptr);
+    explicit DualFeedGUI(std::shared_ptr<SharedData> &sharedData, const cv::Mat& cameraMatrix, const cv::Mat& distCoeffs,Ort::Session* midasSession,std::array<int64_t, 4> &inputShape,std::vector<const char*> &inputNames,std::vector<const char*> &outputNames, QWidget *parent = nullptr);
     ~DualFeedGUI();
 
     void startCameras();
@@ -317,18 +498,23 @@ private:
     bool isRunning = false;
     cv::Mat cameraMatrix;
     cv::Mat distCoeffs;
+    Ort::Session* midasSession;
+    std::vector<const char*> inputNames,outputNames;
+    std::array<int64_t, 4> inputShape;
     void processAruco(cv::Mat &frame);
-    void processObstacleDetection(cv::Mat &frame);
+    void processObstacleDetection(cv::Mat &frame,Ort::Session* midasSession,std::array<int64_t, 4> &inputShape,std::vector<const char*> &inputNames,std::vector<const char*> &outputNames);
 };
-
 #include "obstacle_avoidance.moc"
 #include <opencv4/opencv2/objdetect/aruco_detector.hpp>
 
-DualFeedGUI::DualFeedGUI(std::shared_ptr<SharedData> &sharedData,const cv::Mat &cameraMatrix, const cv::Mat &distCoeffs, QWidget *parent) {
+DualFeedGUI::DualFeedGUI(std::shared_ptr<SharedData> &sharedData,const cv::Mat &cameraMatrix, const cv::Mat &distCoeffs,Ort::Session* midasSession,std::array<int64_t, 4> &inputShape,std::vector<const char*> &inputNames,std::vector<const char*> &outputNames, QWidget *parent) :midasSession(midasSession) {
 
     // std::cout << "Constructor Camera Matrix:\n" << cameraMatrix << std::endl;
     // std::cout << "Constructor Distortion Coefficients:\n" << distCoeffs << std::endl;
-
+    // this->midasSession = midasSession;
+    this->inputShape = inputShape;
+    this->inputNames =inputNames;
+    this->outputNames = outputNames;
     this->cameraMatrix = cameraMatrix;
     this->distCoeffs = distCoeffs;
     this->sharedData = sharedData;
@@ -422,7 +608,7 @@ bool loadCameraCalibration(const std::string& filepath, cv::Mat& cameraMatrix, c
 void DualFeedGUI::startCameras() {
     if (!isRunning) {
         cap1.open(0); // Camera 1 for ArUco
-        // cap1.open(1); // Camera 2 for Obstacle Detection
+        // cap1.open(2); // Camera 2 for Obstacle Detection
         
         if (!cap1.isOpened()) {
             rgbLabel->setText("Error: Camera(s) not found!");
@@ -450,23 +636,22 @@ void DualFeedGUI::updateFrames() {
     cap1 >> frame2;
     
     if (frame1.empty() || frame2.empty()) return;
-    
     processAruco(frame1);
-    processObstacleDetection(frame2);
+    processObstacleDetection(frame2,midasSession,inputShape,inputNames,outputNames);
     
     QImage img1(frame1.data, frame1.cols, frame1.rows, frame1.step, QImage::Format_RGB888);
     rgbLabel->setPixmap(QPixmap::fromImage(img1.rgbSwapped()).scaled(rgbLabel->size(), Qt::KeepAspectRatio));
     
+    // edgeLabel->setPixmap(QPixmap::fromImage(img2).scaled(edgeLabel->size(), Qt::KeepAspectRatio));
+    // QImage img2(frame2.data, frame2.cols, frame2.rows, frame2.step, QImage::Format_RGB888);
+    // edgeLabel->setPixmap(QPixmap::fromImage(img2.rgbSwapped()).scaled(edgeLabel->size(), Qt::KeepAspectRatio));
+
     QImage img2(frame2.data, frame2.cols, frame2.rows, frame2.step, QImage::Format_Grayscale8);
     edgeLabel->setPixmap(QPixmap::fromImage(img2).scaled(edgeLabel->size(), Qt::KeepAspectRatio));
 }
 
 void DualFeedGUI::processAruco(cv::Mat &frame) {
-    // std::cout << "PA Camera Matrix:\n" << cameraMatrix << std::endl;
-    // std::cout << "PA Distortion Coefficients:\n" << distCoeffs << std::endl;
-
     // std::lock_guard<std::mutex> lock(sharedData.mtx);
-    // sharedData->detectedMarkerID = 10;
     cv::aruco::DetectorParameters detectorParams = cv::aruco::DetectorParameters();
     cv::aruco::Dictionary dictionary = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_5X5_250);
     cv::aruco::ArucoDetector detector(dictionary, detectorParams);
@@ -474,9 +659,9 @@ void DualFeedGUI::processAruco(cv::Mat &frame) {
     std::vector<int> markerIds;
     std::vector<std::vector<cv::Point2f>> markerCorners, rejected;
     detector.detectMarkers(frame, markerCorners, markerIds, rejected);
-    
     if (!markerIds.empty()) {
         cv::aruco::drawDetectedMarkers(frame, markerCorners, markerIds);
+        sharedData->corners = markerCorners.at(0);
         sharedData->markerVisible = true;
     }
     else{
@@ -514,7 +699,7 @@ void DualFeedGUI::processAruco(cv::Mat &frame) {
 
     try{
         for(unsigned int i = 0; i < markerIds.size(); i++){
-            cv::drawFrameAxes(frame, cameraMatrix, distCoeffs, rvecs[i], tvecs[i], markerLength, 2);
+            cv::drawFrameAxes(frame, cameraMatrix, distCoeffs, rvecs, tvecs, markerLength, 2);
         }
     }
     catch (const std::exception &e) {
@@ -531,26 +716,120 @@ void DualFeedGUI::processAruco(cv::Mat &frame) {
 
     for (size_t i = 0; i < markerIds.size(); ++i) {
         // Display marker ID and position
-        // std::cout << "Marker ID: " << markerIds[i]
-        //           << " Translation: " << tvecs[i]
-        //           << " Rotation: " << rvecs[i] << std::endl;
-
-        sharedData->x = tvecs[i][0];
-        sharedData->y = tvecs[i][1];
-        sharedData->z = tvecs[i][2];
-        sharedData->roll = rvecs[i][0];
-        sharedData->pitch = rvecs[i][1];
-        sharedData->yaw = rvecs[i][2];
+        // std::cout << "Marker ID: " << markerIds
+        //           << " Translation: " << tvecs
+        //           << " Rotation: " << rvecs << std::endl;
+        sharedData->x = tvecs[0][0];
+        sharedData->y = tvecs[0][1];
+        sharedData->z = tvecs[0][2];
+        sharedData->roll = rvecs[0][0];
+        sharedData->pitch = rvecs[0][1];
+        sharedData->yaw = rvecs[0][2];
     }
 
 }
 
-void DualFeedGUI::processObstacleDetection(cv::Mat &frame) {
-    cv::Mat edges;
-    cv::cvtColor(frame, edges, cv::COLOR_BGR2GRAY);
-    cv::GaussianBlur(edges, edges, cv::Size(5, 5), 1.5);
-    cv::Canny(edges, edges, 50, 150);
-    frame = edges;
+void DualFeedGUI::processObstacleDetection(cv::Mat &frameTwo,Ort::Session* midasSession, std::array<int64_t, 4> &inputShape,std::vector<const char*> &inputNames,std::vector<const char*> &outputNames) {
+    cv::Mat resizedFrame;
+    cv::Mat frame = frameTwo;
+    cv::resize(frame, resizedFrame, cv::Size(256, 256));
+    resizedFrame.convertTo(resizedFrame, CV_32F, 1.0f / 255.0f);
+    cv::cvtColor(resizedFrame, resizedFrame, cv::COLOR_BGR2RGB);
+
+    // Convert to float tensor
+    std::vector<float> inputTensorValues(1 * 3 * 256 * 256);
+    int index = 0;
+    for (int c = 0; c < 3; c++) {
+        for (int i = 0; i < 256; i++) {
+            for (int j = 0; j < 256; j++) {
+                inputTensorValues[index++] = resizedFrame.at<cv::Vec3f>(i, j)[c];
+            }
+        }
+    }
+
+    Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+    Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
+        memoryInfo, inputTensorValues.data(), inputTensorValues.size(),
+        inputShape.data(), inputShape.size()
+    );
+
+    std::vector<Ort::Value> outputTensors = midasSession->Run(
+        Ort::RunOptions{nullptr}, inputNames.data(), &inputTensor, 1, outputNames.data(), 1
+    );
+
+    float* outputData = outputTensors[0].GetTensorMutableData<float>();
+    cv::Mat depthMap(256, 256, CV_32F, outputData);
+
+    // Normalize depth map
+    cv::Mat depthDisplay;
+    cv::normalize(depthMap, depthDisplay, 0, 255, cv::NORM_MINMAX);
+    depthDisplay.convertTo(depthDisplay, CV_8U);
+
+    // Apply Gaussian Blur to smooth noise
+    cv::GaussianBlur(depthDisplay, depthDisplay, cv::Size(5, 5), 0);
+
+    // Compute adaptive threshold based on mean depth
+    double minVal, maxVal;
+    cv::minMaxLoc(depthDisplay, &minVal, &maxVal);
+    double adaptiveThreshold = minVal + (maxVal - minVal) * 0.3;  // Adjusting factor
+
+    cv::Mat binaryMask;
+    cv::threshold(depthDisplay, binaryMask, adaptiveThreshold, 255, cv::THRESH_BINARY);
+
+    // Apply Morphological Operations to clean up noise
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(binaryMask, binaryMask, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(binaryMask, binaryMask, cv::MORPH_OPEN, kernel);
+
+    // Divide into Left, Center, Right
+    int width = binaryMask.cols;
+    int height = binaryMask.rows;
+    int regionWidth = width / 3;
+
+    cv::Mat leftRegion = binaryMask(cv::Rect(0, 0, regionWidth, height));
+    cv::Mat centerRegion = binaryMask(cv::Rect(regionWidth, 0, regionWidth, height));
+    cv::Mat rightRegion = binaryMask(cv::Rect(2 * regionWidth, 0, regionWidth, height));
+
+    // Weighted pixel sum for better accuracy
+    double leftWeight = cv::sum(leftRegion)[0] * 1.2;  // Slightly higher weight
+    double centerWeight = cv::sum(centerRegion)[0];
+    double rightWeight = cv::sum(rightRegion)[0] * 1.2; // Slightly higher weight
+
+    double obstacleThreshold = 5000000.0;
+
+    std::string obstaclePosition;
+    if (leftWeight < obstacleThreshold && centerWeight < obstacleThreshold && rightWeight < obstacleThreshold) {
+        obstaclePosition = "Obstacle: None";
+        sharedData->ObstacleDirection = "None";
+        sharedData->obstacleDetected = false;
+    } else if (centerWeight > leftWeight && centerWeight > rightWeight) {
+        obstaclePosition = "Obstacle: CENTER!";
+        sharedData->ObstacleDirection = "CENTER";
+        sharedData->obstacleDetected = true;
+    } else if (leftWeight > rightWeight) {
+        obstaclePosition = "Obstacle: LEFT!";
+        sharedData->ObstacleDirection = "LEFT";
+        sharedData->obstacleDetected = true;
+    } else {
+        obstaclePosition = "Obstacle: RIGHT!";
+        sharedData->ObstacleDirection = "RIGHT";
+        sharedData->obstacleDetected = true;
+    }
+
+    // Display result
+    cv::resize(depthDisplay,depthDisplay,cv::Size(640,480));
+    cv::resize(binaryMask,binaryMask,cv::Size(640,480));
+
+    cv::putText(frame, obstaclePosition, cv::Point(30, 50), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 0, 0), 2);
+    cv::putText(depthDisplay, obstaclePosition, cv::Point(30, 50), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 0, 0), 2);
+    cv::putText(binaryMask, obstaclePosition, cv::Point(30, 50), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(255, 0, 0), 2);
+
+    // cv::imshow("Original", frame);
+    // cv::imshow("Depth Estimation", depthDisplay);
+    // cv::imshow("Obstacle Detection", binaryMask);
+
+    // frameTwo = frame;
+    frameTwo = depthDisplay;
 }
 
 void runBehaviorTree(std::shared_ptr<SharedData> sharedData) {
@@ -565,8 +844,8 @@ void runBehaviorTree(std::shared_ptr<SharedData> sharedData) {
     factory.registerNodeType<ApproachMarker>("ApproachMarker",sharedData);
     factory.registerNodeType<AvoidObstacles>("AvoidObstacles");
     factory.registerNodeType<FollowPath>("FollowPath");   
-
-    auto tree = factory.createTreeFromFile("./../tree/treeV1.xml");
+    factory.registerNodeType<GoalReached>("GoalReached",sharedData);
+    auto tree = factory.createTreeFromFile("./../tree/treeV2.xml");
     
     // Keep running behavior tree
     tree.tickWhileRunning();
@@ -595,8 +874,10 @@ int main(int argc, char *argv[]) {
 
     QApplication app(argc, argv);
     auto sharedData = std::make_shared<SharedData>();
-
     map<pair<int, int>, string> myMap;
+    //Temporoary 
+    myMap[{0, 1}] = "Left";
+    myMap[{0,2}] = "Right";
     myMap[{1, 2}] = "Right";
     myMap[{1, 3}] = "Left";
     myMap[{2, 6}] = "Right";
@@ -604,20 +885,34 @@ int main(int argc, char *argv[]) {
     myMap[{4, 5}] = "Left";
     myMap[{5, 6}] = "Left";
 
+    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ObstacleDetection");
+    Ort::SessionOptions sessionOptions;
+    sessionOptions.SetIntraOpNumThreads(1);
 
+    const std::string modelPath = "/home/vinoth/arboric/obstacleAvoidance/midas_v21_small_256.onnx";
+    Ort::Session midasSession(env, modelPath.c_str(), sessionOptions);
+    
+    Ort::AllocatorWithDefaultOptions allocator;
+    Ort::AllocatedStringPtr inputName = midasSession.GetInputNameAllocated(0, allocator);
+    Ort::AllocatedStringPtr outputName = midasSession.GetOutputNameAllocated(0, allocator);
+    
+    std::vector<const char*> inputNames = {inputName.get()};
+    std::vector<const char*> outputNames = {outputName.get()};
+
+    std::array<int64_t, 4> inputShape = {1, 3, 256, 256};
+    
     // Load Camera Calibration
     cv::Mat cameraMatrix, distCoeffs;
     std::string load_path = "./../CamCalibration/camera_parameters.yaml";
     if (loadCameraCalibration(load_path, cameraMatrix, distCoeffs)) {
-        std::cout << "Camera Matrix:\n" << cameraMatrix << std::endl;
-        std::cout << "Distortion Coefficients:\n" << distCoeffs << std::endl;
+        // std::cout << "Camera Matrix:\n" << cameraMatrix << std::endl;
+        // std::cout << "Distortion Coefficients:\n" << distCoeffs << std::endl;
     } else {
-        std::cerr << "Failed to load calibration data!" << std::endl;
+        // std::cerr << "Failed to load calibration data!" << std::endl;
         return -1;
     }
 
-    // int serial_port = openSerialPort("/dev/ttyACM0");
-    int serial_port = 2;
+    int serial_port = openSerialPort("/dev/ttyACM0");
     if (serial_port < 0) {
         return 1;  // Exit if serial port fails
     }
@@ -626,14 +921,14 @@ int main(int argc, char *argv[]) {
     // Start Aruco Processing in a separate QThread
     // ArucoProcessing arucoThread;
     // arucoThread.start();
-
+    std::cout << " ==========  ARBORIC is ON !! =========" << std::endl;
     // Run Behavior Tree in a separate thread
     std::thread btThread(runBehaviorTree, sharedData);
     // Start GUI
-    DualFeedGUI window(sharedData, cameraMatrix, distCoeffs);
+    DualFeedGUI window(sharedData, cameraMatrix, distCoeffs, &midasSession,inputShape,inputNames,outputNames );
     window.resize(1280, 480);
     window.show();
-
+    
     int result = app.exec();
 
     // Cleanup threads
