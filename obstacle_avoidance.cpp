@@ -31,7 +31,7 @@
 
 #define FRAME_CENTER_X 320  // Adjust based on camera resolution
 #define FRAME_CENTER_Y 240
-#define MARKER_SIZE_THRESHOLD 10000  // Adjust based on marker size wh
+#define MARKER_SIZE_THRESHOLD 300000  // Adjust based on marker size wh
 
 using namespace std::chrono_literals;
 using namespace cv;
@@ -40,13 +40,17 @@ using namespace std;
 struct MarkerNode {
     int marker;
     string relation;
+    vector<int> path; // To store the path of markers
+    vector<string> directions; // To store the list of directions
 };
+
 
 struct SharedData {
     std::mutex mtx;
     std::vector<cv::Point2f> corners;
     string ObstacleDirection = "";
-    string initRot = "";
+    string imm_Dir = "";
+    int imm_ID;
     bool isGUIrequest = false;
     bool markerVisible = false;
     int detectedMarkerID = -1;
@@ -194,9 +198,24 @@ class SpinSearch : public BT::SyncActionNode {
 
             std::string command = "2 2\n";
             write(sharedData->serial_port, command.c_str(), command.length()); 
+            auto start_time = std::chrono::steady_clock::now();
+            while (!sharedData->markerVisible) {
+                std::cout << "Searching for marker...\n";
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-            // std::this_thread::sleep_for(std::chrono::seconds(2));
-            return BT::NodeStatus::FAILURE;
+                // Check if 5 seconds have passed
+                auto elapsed_time = std::chrono::steady_clock::now() - start_time;
+                if (std::chrono::duration_cast<std::chrono::seconds>(elapsed_time).count() >= 5) {
+                    std::cout << "Marker not found within 5 seconds. Returning FAILURE.\n";
+                    return BT::NodeStatus::FAILURE;
+                }
+            }
+
+            // If marker is detected before timeout
+            std::string stop_cmd = "0 0\n";
+            write(sharedData->serial_port, stop_cmd.c_str(), stop_cmd.length());
+            std::cout << "Marker detected! Returning SUCCESS.\n";
+            return BT::NodeStatus::SUCCESS;
         }
     private:
         std::shared_ptr<SharedData> sharedData;
@@ -218,8 +237,17 @@ class MoveSlightly : public BT::SyncActionNode {
             std::string command = "1 1\n";
             write(sharedData->serial_port, command.c_str(), command.length()); 
 
-            // std::this_thread::sleep_for(std::chrono::seconds(1));
-            return BT::NodeStatus::FAILURE;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+
+            std::string stop_cmd = "0 0\n";
+            write(sharedData->serial_port, stop_cmd.c_str(), stop_cmd.length());
+            
+            if (sharedData->markerVisible) {
+                return BT::NodeStatus::SUCCESS;
+            }
+            else{
+                return BT::NodeStatus::FAILURE;
+            }
         }
     private:
         std::shared_ptr<SharedData> sharedData;
@@ -237,11 +265,21 @@ public:
 
     BT::NodeStatus tick() override {
         std::cout << "Storing marker relation...\n";
-        string direction;
+        pair<string, int> result;
+        std::string direction;
         if (sharedData->markerVisible){
-            direction = findRelation(sharedData->detectedMarkerID, sharedData->targetMarkerID, sharedData->MarkerMap);
+            if( sharedData-> detectedMarkerID == sharedData->targetMarkerID){
+                std::cout << "Marker is already in front of the robot!" << std::endl;
+                sharedData->imm_Dir = "NONE";
+                return BT::NodeStatus::SUCCESS;
+            }
+            else{
+                result = findRelation(sharedData->detectedMarkerID, sharedData->targetMarkerID, sharedData->MarkerMap);
+                sharedData->imm_Dir = result.first;
+                direction = result.first;
+                sharedData->imm_ID = result.second;
+            }
         }
-        sharedData->initRot = direction;
         if (direction == "NONE"){
             std::cout << "The Marker has to move straight. No Turning Needed" <<std::endl;
         }
@@ -256,64 +294,95 @@ public:
     }
 
         
-    string getOppositeDirection(const string& direction) {
+    string getReverseDirection(const string& direction) {
         if (direction == "Right") return "Left";
         if (direction == "Left") return "Right";
-        return direction; // Default case (if other directions exist)
+        return ""; // Default case for unknown directions
     }
-
-    // Function to find the relation between two markers
-    string findRelation(int start, int end, map<pair<int, int>, string>& myMap) {
-        // Step 1: Convert map into bidirectional adjacency list with opposite directions
-        if (start == end ){
-            return "NONE";
+    
+    // Function to find the relation from start to end using BFS
+    pair<string, int> findRelation(int start, int end, map<pair<int, int>, string>& myMap) {
+        if (start == end){
+            std::cout << "Start and end markers are the same!" << std::endl;
+            return make_pair("NONE", start);
         }
+        // Step 1: Convert map into bidirectional adjacency list
         unordered_map<int, vector<pair<int, string>>> adj;
         for (const auto& it : myMap) {
-            int from = it.first.first;
-            int to = it.first.second;
+            int from = get<0>(it.first);
+            int to = get<1>(it.first);
             string direction = it.second;
-
-            // Store both directions (with reversed meaning)
+    
+            // Store both directions
             adj[from].push_back({to, direction});
-            adj[to].push_back({from, getOppositeDirection(direction)}); // Reverse connection
+            if (myMap.find({to, from}) == myMap.end()) { // If reverse direction is not explicitly declared
+                adj[to].push_back({from, getReverseDirection(direction)});
+            }
         }
-
-        // Step 2: BFS to find the shortest path
+    
+        // Step 2: BFS to find shortest path
         queue<MarkerNode> q;
         unordered_map<int, bool> visited;
-
-        q.push({start, ""});
+        std::string imm_Dir;
+        int imm_ID;
+        q.push({start, "", {start}, {}}); // Initialize with start marker
         visited[start] = true;
-
+    
         while (!q.empty()) {
             MarkerNode current = q.front();
             q.pop();
-
+            
             if (current.marker == end) {
                 cout << "Relation from " << start << " to " << end << ": " << current.relation << endl;
-                return current.relation;
+                cout << "Intermediate markers: ";
+                for (int marker : current.path) {
+                    cout << marker << " ";
+                }
+                cout << endl;
+    
+                cout << "Direction order: ";
+                for (const string& dir : current.directions) {
+                    cout << dir << " ";
+                }
+                cout << endl;
+    
+                // // Iterate over the vector with index
+                // for (size_t i = 0; i < current.directions.size(); ++i) {
+                //     std::cout << "Index: " << i << ", Value: " << current.directions[i] << endl;
+                // }
+                imm_Dir = current.directions[0];
+                imm_ID = current.path[1];
+                std::cout << "initial params: " << imm_ID << " " << imm_Dir << endl;
+                return make_pair(imm_Dir, imm_ID);
             }
-
+    
             for (const auto& neighbor : adj[current.marker]) {
                 int nextNode = neighbor.first;
                 string newDirection = neighbor.second;
-
-                // Merge consecutive identical directions
+    
+                // Merge identical consecutive directions
                 string newRelation;
                 if (current.relation.empty() || current.relation == newDirection) {
                     newRelation = newDirection;
                 } else {
                     newRelation = current.relation + " → " + newDirection;
                 }
-
+    
                 if (!visited[nextNode]) {
                     visited[nextNode] = true;
-                    q.push({nextNode, newRelation});
+    
+                    // Create a new path and direction list for the next node
+                    vector<int> newPath = current.path;
+                    newPath.push_back(nextNode);
+    
+                    vector<string> newDirections = current.directions;
+                    newDirections.push_back(newDirection);
+    
+                    q.push({nextNode, newRelation, newPath, newDirections});
                 }
             }
         }
-
+    
         cout << "No relation found between " << start << " and " << end << endl;
     }
 
@@ -338,38 +407,62 @@ public:
             std::cerr << "Missing marker_id input!\n";
             return BT::NodeStatus::FAILURE;
         }
+        std::cout << "Detected: " << sharedData->detectedMarkerID << std::endl;
+        std::cout << "Target: " << sharedData->targetMarkerID << std::endl;
+        
+        if (sharedData->detectedMarkerID != sharedData->targetMarkerID){
+            std::cout << "Target marker not found. so not approaching..";
+            return BT::NodeStatus::FAILURE;
+        }
         auto serial_port = sharedData->serial_port;
 
-        string dir = sharedData->initRot;
+        string dir = sharedData->imm_Dir;
         std::cout << "Rotating to see the marker!" << std::endl;
-
+        std::string cmd;
         if (dir ==  "NONE"){
             cout << "Moving Straight.." << endl;
+            cmd = "1 1\n";
         }
         else if (dir ==  "Right"){
             cout << "Moving RIGHT.." << endl;
+            cmd = "0 1\n";
         }
         else if (dir ==  "Left"){
             cout << "Moving LEFT.." << endl;
+            cmd = "1 0\n";
         }
+        write(serial_port, cmd.c_str(), cmd.length());
+
 
         while (!sharedData->obstacleDetected && sharedData->markerVisible){
             std::cout << "Approaching marker " << sharedData->targetMarkerID << "...\n";
             MoveToMarker();
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // std::this_thread::sleep_for(std::chrono::seconds(1));
         }
         
         if(sharedData->ObstacleDirection == "RIGHT"){
-            std::cout << "Move left .. "<<std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::cout << "Obstacle on RIGHT. Robot is moving left .. "<<std::endl;
+            std ::string cmd = "1 0\n";
+            write(serial_port, cmd.c_str(), cmd.length());
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            cmd = "0 0\n";
+            write(serial_port, cmd.c_str(), cmd.length());
         }
         else if(sharedData->ObstacleDirection == "CENTER") {
-            std::cout << "Move right .. "<<std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::cout << "Obstacle on CENTER. Robot is moving left .. "<<std::endl;
+            std ::string cmd = "1 0\n";
+            write(serial_port, cmd.c_str(), cmd.length());
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            cmd = "0 0\n";
+            write(serial_port, cmd.c_str(), cmd.length());
         }
         else if(sharedData->ObstacleDirection == "LEFT") {
-            std::cout << "Move right .. "<<std::endl;
-            std::this_thread::sleep_for(std::chrono::seconds(3));
+            std::cout << "Obstacle on LEFT. Robot is moving right .. "<<std::endl;
+            std ::string cmd = "0 1\n";
+            write(serial_port, cmd.c_str(), cmd.length());
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            cmd = "0 0\n";
+            write(serial_port, cmd.c_str(), cmd.length());
         }
         
         // std::string command = std::to_string(marker_id) + "\n";
@@ -378,7 +471,7 @@ public:
         //     write(serial_port, command.c_str(), command.size());
         //     this_thread::sleep_for(1000ms);
         // }
-        if (sharedData->markerVisible){
+        if (sharedData->markerVisible && sharedData->detectedMarkerID == sharedData->targetMarkerID) {
             return BT::NodeStatus::SUCCESS;
         }
         else {
@@ -389,31 +482,42 @@ public:
     void MoveToMarker(){
         std::cout << "Corners: [ ";
         corners = sharedData->corners;
-            std::cout << "[ ";
-            for (const auto& pt : corners) {
-                std::cout << "(" << pt.x << ", " << pt.y << ") ";
-            }
-            std::cout << "] ";
-        std::cout << "]" << std::endl;
+        // std::cout << "[ ";
+        // for (const auto& pt : corners) {
+        //     std::cout << "(" << pt.x << ", " << pt.y << ") ";
+        // }
+        // std::cout << "] ";
+        // std::cout << "]" << std::endl;
         Point2f marker_center = (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25;
-                int marker_x = static_cast<int>(marker_center.x);
-                int marker_y = static_cast<int>(marker_center.y);
+        int marker_x = static_cast<int>(marker_center.x);
+        int marker_y = static_cast<int>(marker_center.y);
 
-                // Compute the marker size (approximate area)
-                float marker_size = norm(corners[0] - corners[2]) * norm(corners[1] - corners[3]);
-
-                // Movement Logic
-                if (marker_size > MARKER_SIZE_THRESHOLD) {
-                    std::cout << "Stop" << std::endl;
-                    // sendCommand("Stop");
-                } else if (abs(marker_x - FRAME_CENTER_X) < 50) {  // Centered
-                    std::cout << "FORWARD" << std::endl;
-                } else if (marker_x < FRAME_CENTER_X) {  // Marker is left
-                    std::cout << "Left" << std::endl;
-                } else {  // Marker is right
-                    std::cout << "Right" << std::endl;
-                }
-            }
+        // Compute the marker size (approximate area)
+        float marker_size = norm(corners[0] - corners[2]) * norm(corners[1] - corners[3]);
+        // std::cout << "Marker Size: " << marker_size << endl;
+        // Movement Logic
+        std::string cmnd;
+        std::string stop = "0 0\n";
+        if (marker_size > MARKER_SIZE_THRESHOLD) {
+            std::cout << "STOP" << std::endl;
+            write(sharedData->serial_port, stop.c_str(), stop.length());
+            sharedData->GoalReached = true;
+            std::cout << "Marker is large enough. Stopping robot." << std::endl;
+            std :: cout << "============================================" << std::endl;
+        } else if (abs(marker_x - FRAME_CENTER_X) < 50) {  // Centered
+            cmnd = "1 1\n";
+            write(sharedData->serial_port, cmnd.c_str(), cmnd.length());
+            std::cout << "FORWARD" << std::endl;
+        } else if (marker_x < FRAME_CENTER_X) {  // Marker is left
+            cmnd = "1 0\n";
+            write(sharedData->serial_port, cmnd.c_str(), cmnd.length());
+            std::cout << "LEFT" << std::endl;
+        } else {  // Marker is right
+            cmnd = "0 1\n";
+            write(sharedData->serial_port, cmnd.c_str(), cmnd.length());
+            std::cout << "RIGHT" << std::endl;
+        }
+    }
 private:
     std::shared_ptr<SharedData> sharedData;
     std::vector<cv::Point2f> corners;
@@ -464,8 +568,16 @@ public:
         return { BT::InputPort<int>("marker_id") };
     }
     BT::NodeStatus tick() override {
-        if (sharedData->GoalReached)
+        if (sharedData->GoalReached){
             std::cout << "Goal Reached :)) " <<std::endl;
+            std :: cout << "============================================" << std::endl;
+            return BT::NodeStatus::SUCCESS;
+        }
+        else if(sharedData->markerVisible && sharedData->obstacleDetected){
+            std::cout << "Goal Reached" << std::endl;
+            std :: cout << "============================================" << std::endl;
+            return BT::NodeStatus::SUCCESS;
+        }
         else {
             std::cout << "Goal Not Reached :( " <<std::endl;
         }
@@ -795,7 +907,7 @@ void DualFeedGUI::processObstacleDetection(cv::Mat &frameTwo,Ort::Session* midas
     double centerWeight = cv::sum(centerRegion)[0];
     double rightWeight = cv::sum(rightRegion)[0] * 1.2; // Slightly higher weight
 
-    double obstacleThreshold = 5000000.0;
+    double obstacleThreshold = 5000000.0 * 1.3;
 
     std::string obstaclePosition;
     if (leftWeight < obstacleThreshold && centerWeight < obstacleThreshold && rightWeight < obstacleThreshold) {
@@ -877,10 +989,10 @@ int main(int argc, char *argv[]) {
     map<pair<int, int>, string> myMap;
     //Temporoary 
     myMap[{0, 1}] = "Left";
-    myMap[{0,2}] = "Right";
+    myMap[{0, 2}] = "Right";
     myMap[{1, 2}] = "Right";
     myMap[{1, 3}] = "Left";
-    myMap[{2, 6}] = "Right";
+    myMap[{2, 3}] = "Right";
     myMap[{3, 4}] = "Left";
     myMap[{4, 5}] = "Left";
     myMap[{5, 6}] = "Left";
@@ -911,6 +1023,7 @@ int main(int argc, char *argv[]) {
         // std::cerr << "Failed to load calibration data!" << std::endl;
         return -1;
     }
+
 
     int serial_port = openSerialPort("/dev/ttyACM0");
     if (serial_port < 0) {
